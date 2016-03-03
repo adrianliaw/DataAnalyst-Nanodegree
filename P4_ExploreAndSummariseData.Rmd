@@ -1,0 +1,764 @@
+"Meta Kaggle" Exploration by Adrian Liaw
+========================================================
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, packages}
+# Load all of the packages that you end up using
+# in your analysis in this code chunk.
+
+# Notice that the parameter "echo" was set to FALSE for this code chunk.
+# This prevents the code from displaying in the knitted HTML output.
+# You should set echo=FALSE for all code chunks in your file.
+
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(scales)
+library(magrittr)
+library(DBI)
+library(RSQLite)
+```
+
+```{r echo=FALSE, Load_the_Data}
+# Load the Data
+con <- dbConnect(SQLite(), "database.sqlite")
+
+competitions <- dbGetQuery(con, "SELECT * FROM Competitions")
+teams <- dbGetQuery(con, "SELECT * FROM Teams")
+team.memberships <- dbGetQuery(con, "SELECT * FROM TeamMemberships")
+users <- dbGetQuery(con, "SELECT * FROM Users")
+submissions <- dbGetQuery(con, "SELECT * FROM Submissions")
+reward.types <- dbGetQuery(con, "SELECT * FROM RewardTypes")
+evaluation.algs <- dbGetQuery(con, "SELECT * FROM EvaluationAlgorithms")
+```
+
+## Background
+[Kaggle](https://www.kaggle.com/) is a platform for data prediction competitions, they call Kaggle "The home of data science". There are hundreds of competitions out there, many of them are hosted by companies and have money as prizes, like [Home Depot](https://www.kaggle.com/c/home-depot-product-search-relevance), [Yelp](https://www.kaggle.com/c/yelp-restaurant-photo-classification) and [Airbnb](https://www.kaggle.com/c/airbnb-recruiting-new-user-bookings). They also have a [jobs board](https://www.kaggle.com/jobs), where companies can offer data science jobs, and allow members in the Kaggle community to apply for them. If you'd like to learn more, please visit the [About](https://www.kaggle.com/about) page.
+
+[Recently](http://blog.kaggle.com/2016/01/19/introducing-kaggle-datasets/), Kaggle introduced the [Kaggle Datasets](https://www.kaggle.com/datasets), where you can find some high quality public datasets, like [SF Salaries](https://www.kaggle.com/kaggle/sf-salaries), [Reddit Comments](https://www.kaggle.com/reddit/reddit-comments-may-2015), [US Baby Names](https://www.kaggle.com/kaggle/us-baby-names). Kaggle also released their [Meta Kaggle](https://www.kaggle.com/kaggle/meta-kaggle) dataset, "The dataset on Kaggle, on Kaggle". This dataset contains data about competitions, submissions, users, etc. on the Kaggle platform, and that's what I'm going to explore.  
+*Note: This dataset is not a complete dump, they're just a small subset where some rows, columns, tables have been filtered by Kaggle.*
+
+Although the dataset is not a complete dump, it's still pretty large. There're 10 tables, but I'm only using 6 of them: `Competitions`, `EvaluationAlgorithms`, `Submissions`, `TeamMemberships`, `Teams` and `Users`, each of them has 239, 29, 934345, 68500, 59231, 365878 observations. My analysis will focus on `Competitions`, `Submissions`, `Teams` and `Users`.
+
+```{r echo=FALSE, Adjust_Data}
+# The code below are mainly correcting the type of columns,
+# e.g. use POSIXct instead of datetime string
+to.POSIXct <- function(column) {as.POSIXct(strptime(column, "%F %T"))}
+
+# The original dataset uses string "True" and "False" instead of booleans
+evaluation.algs %<>% mutate(IsMax = as.logical(IsMax))
+
+
+competitions %<>%
+
+  select(Id, CompetitionName, DateEnabled, Deadline, SolutionNumRows,
+         EvaluationAlgorithmId, LeaderboardPercentage, MaxDailySubmissions,
+         NumScoredSubmissions, NumPrizes, RewardTypeId, RewardQuantity,
+         CanQualifyTalent) %>%
+
+  mutate(
+    DateEnabled = to.POSIXct(DateEnabled),
+    Deadline = to.POSIXct(Deadline),
+    CanQualifyTalent = as.logical(CanQualifyTalent),
+    RewardType = factor(RewardTypeId)) %>%
+
+  mutate(
+    Duration = as.double(Deadline - DateEnabled)) %>%
+
+  # Here is an example of join that I'm going to use a lot,
+  # this makes me comfortable to get some values originally not in the table itself.
+  # Here, IsMax tells wether if the ranking is in ascending order of score or descending.
+  left_join(
+    evaluation.algs %>% select(Id, IsMax),
+    by = c("EvaluationAlgorithmId" = "Id"))
+
+# There are actually 5 reward types: USD, Kudos, Jobs, Swag and Knowledge,
+# since only 7 competitions are with reward type of kudos, jobs or swag,
+# I'm going to merge them into "Others"
+levels(competitions$RewardType) <- c("USD", "Others", "Others",
+                                     "Others", "Knowledge")
+
+
+submissions %<>%
+
+  select(-ScoreStatus, -IsAfterDeadline,
+         -DateScored, -ScoringDurationMilliseconds) %>%
+
+  mutate(
+    DateSubmitted = to.POSIXct(DateSubmitted),
+    IsSelected = as.logical(IsSelected)) %>%
+
+  # Another join here, it's convenient to get competition's ID inside submissions table.
+  left_join(
+    teams %>%
+      select(Id, CompetitionId),
+    by = c("TeamId" = "Id")) %>%
+
+  left_join(
+    competitions %>%
+      select(Id, Deadline, DateEnabled, RewardType),
+    by = c("CompetitionId" = "Id")) %>%
+
+  # as.double returns time difference by seconds. Make it in days.
+  mutate(
+    DaysBeforeDeadline = as.double(Deadline - DateSubmitted) / (60*60*24)) %>%
+
+  arrange(CompetitionId, TeamId, DateSubmitted)
+
+# Get z-score of each submission's public and private score in the according competition
+z_scores <- ddply(submissions, .(CompetitionId), plyr::summarise,
+                  PublicZ = as.vector(t(scale(PublicScore))),
+                  PrivateZ = as.vector(t(scale(PrivateScore))))
+
+submissions[,c("PublicScore.Z", "PrivateScore.Z")] <-
+  z_scores[,c("PublicZ", "PrivateZ")]
+
+rm(z_scores)
+
+
+
+teams %<>%
+
+  select(-IsBenchmark, -GithubRepoLink) %>%
+
+  mutate(ScoreFirstSubmittedDate = to.POSIXct(ScoreFirstSubmittedDate)) %>%
+
+  left_join(
+    submissions %>%
+      group_by(TeamId) %>%
+      summarise(N.Submissions = n()),
+    by = c("Id" = "TeamId")) %>%
+
+  left_join(
+    competitions %>%
+      select(Id, RewardQuantity, RewardType, Duration) %>%
+      # I only want RewardQuantity if the prize is in USD
+      mutate(RewardQuantity = ifelse(RewardType == "USD", RewardQuantity, NA)),
+    by = c("CompetitionId" = "Id"))
+
+
+
+users %<>%
+
+  mutate(
+    RegisterDate = to.POSIXct(RegisterDate),
+    Points = as.double(Points),
+    Ranking = as.integer(Ranking),
+    HighestRanking = as.integer(HighestRanking),
+    TierType = factor(Tier)) %>%
+
+  # 16679 is the number of days to Sep 1st 2015 since Jan 1st 1970
+  mutate(
+    DaysBeforeSep2015 = (16679 - as.integer(RegisterDate) / (60*60*24))) %>%
+
+  left_join(
+    submissions %>%
+      group_by(SubmittedUserId) %>%
+      summarise(N.Submissions = n()),
+    by = c("Id" = "SubmittedUserId")) %>%
+
+  left_join(
+    submissions %>%
+      arrange(DateSubmitted) %>%
+      group_by(SubmittedUserId) %>%
+      summarise(DaysAfterLastSubmit =
+                  16679 - as.integer(last(DateSubmitted)) / (60 * 60 * 24)),
+    by = c("Id" = "SubmittedUserId"))
+
+levels(users$TierType) <- c("Novice", "Novice", "Novice",
+                            "Novice", "Kaggler", "Master")
+```
+
+## Univariate Plots Section
+Let's start with making a histogram of total points made by each user.
+```{r echo=FALSE, message=FALSE, warning=FALSE, Users_Points}
+ggplot(users) + geom_histogram(aes(x = Points))
+```
+
+That doesn't look pretty good, let's apply log scale to the y axis.
+```{r echo=FALSE, message=FALSE, warning=FALSE, Users_Points_Log}
+ggplot(users) + geom_histogram(aes(x = Points)) + scale_x_log10()
+```
+
+It's much better, it looks like a normal distrubution with a log scale.  
+Here are some descriptive statistics of points:
+```{r echo=FALSE, Users_Points_Summary}
+summary(subset(users, Points != 0)$Points)
+```
+
+Quantity of the competition reward (in USD):
+```{r echo=FALSE, message=FALSE, warning=FALSE, Reward_Quantity}
+# RewardTypeId == 1 means the reward type is USD
+qplot(
+  subset(competitions, RewardTypeId == 1)$RewardQuantity,
+  xlab = "RewardQuantity")
+
+ggplot(subset(competitions, RewardTypeId == 1)) +
+  geom_histogram(aes(x = RewardQuantity)) +
+  scale_x_log10() +
+  xlab("RewardQuantity (log)")
+```
+
+Since there are only 239 competitions recorded in this dataset (and there're actually more than 750 on Kaggle), we can't really observe something really special only from this table.
+
+Duration of the competitions (`Deadline - DateEnabled`):
+```{r echo=FALSE, message=FALSE, warning=FALSE, Competition_Duration}
+ggplot(competitions) +
+  geom_histogram(aes(x = Duration)) +
+  scale_x_log10() +
+  xlab("Duration (log)")
+```
+
+There isn't this `Duration` variable in the original dataset, I done it with R. The following plot is also about a variable that I've created, `N.Submissions`. `N.Submissions` is a variable of `teams`, it's the number of times each team submitted.  
+*Note that every team is bound to a competition, there's a `CompetitionId` column in the `Teams` table. Also, a single user is a team, every time you submit as a single user, Kaggle records it as a team with 1 member.*
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, N_Submissions}
+ggplot(teams) +
+  geom_histogram(aes(x = N.Submissions), binwidth = 0.05) +
+  scale_x_log10()
+```
+
+That's a highly skewed distribution.
+
+The following plot is about the number of new users joined over time:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Register_Date}
+ggplot(users, aes(x = RegisterDate)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 60 * 60 * 24 * 20,
+                 fill = "white",
+                 colour = "black") +
+  geom_density()
+```
+
+There's a strange peak at about March 2015, since I wasn't familiar with Kaggle then, I can't really explain this peak.
+
+This plot's x-axis is the z-score of submissions' `PublicScore` by each competition.
+```{r echo=FALSE, message=FALSE, warning=FALSE, Public_Score_Z}
+# I only want the competitions that the way of ranking is to get higher score
+# (some competitions aren't), thus `IsMax` from `EvaluationAlgorithms`
+# (I've joined `IsMax` to `competitions` so it's easy to get).
+comps.ismax <- submissions %>%
+  subset(CompetitionId %in% subset(competitions, IsMax == T)$Id)
+
+ggplot(comps.ismax) +
+  geom_histogram(aes(x = PublicScore.Z), binwidth = 0.01)
+```
+
+The following one is basically the same as the previous one, but submissions' `PrivateScore` instead. The private score is what determines the final ranking, but won't be shown before the competition ends. To learn more about public score and private score, please visit [this page](https://www.kaggle.com/wiki/KaggleMemberFAQ)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Private_Score_Z}
+ggplot(comps.ismax) +
+  geom_histogram(aes(x = PrivateScore.Z), binwidth = 0.01)
+```
+
+Here are some descriptive statistics of `PublicScore.Z`:
+```{r echo=FALSE, PublicScoreZ_Summary}
+summary(comps.ismax$PublicScore.Z)
+```
+
+We can see that the median value is above 0, difference between 1st quartile is about 0.59, 0.21 for 3rd quartile, which is a slightly skewed distribution.
+
+Submissions by days before competitions' deadlines:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Days_Before_Deadline}
+ggplot(submissions) +
+  geom_histogram(aes(x = DaysBeforeDeadline), binwidth = 1) +
+  scale_x_reverse() +
+  coord_cartesian(xlim = c(400, -50))
+```
+
+This is quite interesting that, a lot of submissions seem to be happened in the last day of competitions.
+
+The following plot shows the distribution of difference between current ranking and highest ranking of each user:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Diff_Rankings}
+qplot(users$Ranking - users$HighestRanking)
+
+summary(users$Ranking - users$HighestRanking)
+```
+
+Here are three bar charts showing the amount of users within each tier. Kaggle users are separated into 3 different tiers: Novice, Kaggler and Master. [Learn more](https://www.kaggle.com/wiki/UserRankingAndTierSystem)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Tier_Type}
+qplot(users$TierType)
+
+ggplot(users) +
+  geom_bar(aes(x = TierType)) +
+  scale_y_log10() +
+  ylab("log(count)")
+
+qplot(subset(users, !is.na(Ranking))$TierType, xlab = "users$Tier")
+```
+
+In the first bar chart, we can see that novice users is an extremely large proportion of total Kaggle users. But in the third plot, I've removed all the users that doesn't have ranking (doesn't have any activity), and you can see, the bar of Kaggler is the highest one, and Masters is only a tiny portion.
+
+## Univariate Analysis
+
+### What is the structure of your dataset?
+The dataset was designed with relational model, there're 6 tables I'm using, please visit the [description](https://www.kaggle.com/kaggle/meta-kaggle) for the list of columns.
+
+The `Competitions` table has 239 rows, `Submissions` has 934345, `Teams` has 59231, `TeamMemberships` has 68500, `Users` has 365878.
+
+Variables like `Points`, `PublicScore`, `PrivateScore`, `RewardQuantity`, `Ranking` etc. are numeric, and also continuous. Variables like `Deadline`, `DateEnabled`, `DateSubmitted`, `RegisterDate` etc. are dates, which is also continuous. There's one categorical variable, `TierType` in `Users` (Novice -> Kaggler -> Master).
+
+### What is/are the main feature(s) of interest in your dataset?
+The main feature of interest is the `Ranking` (or `Score`, they're basically the same). I'll try to explore what other variables might have relationship with the ranking.
+
+### What other features in the dataset do you think will help support your investigation into your feature(s) of interest?
+Variables like `Deadline`, `DateEnabled`, `DaysBeforeDeadline` etc., those time variables will probably going to be helpful, because they can show the density of submissions by teams or users. When someone submitted very frequently, that might because he was getting higher and higher accuracy, thus having higher rank. Also, `RewardQuantity` is definitely another feature that is helpful.
+
+### Did you create any new variables from existing variables in the dataset?
+Yes, I created `DaysBeforeDeadline`, `PublicScore.Z`, `PrivateScore.Z` in `Submissions` table, `N.Submissions` in `Teams` table.
+
+### Of the features you investigated, were there any unusual distributions? Did you perform any operations on the data to tidy, adjust, or change the form of the data? If so, why did you do this?
+It's pretty hard to say there's anything unusual. However, I think the distribution of `PublicScore.Z` is a bit interesting, most of them are located above 0, which is above average in the corresponding competition, but there are also some strange peaks between -0.5 and -4, I think they're probably some submissions which the content is "all zeros".
+
+I did some adjustment on `Competitions`, `Submissions`, `Users` and `Teams`, I changed the data type of some variables, mainly datetime variables. I also did some joins, which makes it no need to use join everytime. Finally, the `TierType` in `Users`, I converted the integer field `Tier` to a categorical variable `TierType` so it clearly separates 3 tiers: Novice, Kaggler and Master.
+
+
+## Bivariate Plots Section
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Random_Sampling}
+# Note: Change to TRUE if you want to use a sample.
+# It takes some time to draw the plot for all data points.
+if(FALSE) {
+  tmp.submissions <- submissions
+  submissions %<>% sample_n(50000)
+} else {
+  tmp.submissions <- submissions
+}
+
+users %<>% subset(!is.na(Ranking))
+```
+
+Let's start with a scatterplot, this is the scatterplot of `PublicScore.Z` and `PrivateScore.Z`, as you might expect, they have a linear relationship.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, PublicScore_to_PrivateScore}
+ggplot(submissions) +
+  geom_point(aes(x = PublicScore.Z, y = PrivateScore.Z), alpha = 0.1) +
+  scale_x_log10() +
+  scale_y_log10() +
+  xlab("PublicScore.Z (log)") +
+  ylab("PrivateScore.Z (log)")
+
+with(submissions, cor.test(PublicScore.Z, PrivateScore.Z))
+```
+
+There're also some outliers, some are getting high public score but low private score, and they might be those ungeneralised solutions.
+
+In the following scatterplot, the x-axis represents how many days before the deadline the user submitted, and the y-axis is z-scores of the submissions' public score:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, DaysBeforeDeadline_to_PublicScore}
+ggplot(submissions) +
+  geom_point(aes(x = DaysBeforeDeadline,
+                 y = PublicScore.Z),
+             alpha = 0.1, size = 1) +
+  scale_y_log10() +
+  xlim(0, 400)
+```
+
+I was expecting to have some relationship where `PublicScore.Z` is getting higher when `DaysBeforeDeadline` is getting smaller, but there isn't in this plot. Notice there're some points looked close to each other and making a curve-like path, they might be submitted by the same user/team, and was trying to get a higher score on the same competition, so submitted many times within a few days, hence we can see those paths.
+
+In this following histogram, I filled those bars with different colours for different tiers:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Points_to_TierType}
+ggplot(users) +
+  geom_histogram(aes(x = Points, fill = TierType), binwidth = 0.1) +
+  scale_x_log10()
+```
+
+We can see there's no "Novice" users appearing in the plot, that's because novice users are users those didn't earn any ranking points, like me.
+
+Another way to make this plot is to draw each tier's bar separately:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Points_to_TierType_Dodge}
+ggplot(users) +
+  geom_histogram(aes(x = Points, fill = TierType),
+                 binwidth = 0.1,
+                 position = "dodge") +
+  scale_x_log10() +
+  scale_y_sqrt()
+```
+
+The frequency polygon plot below is basically the same as the previous ones, but instead plots the density:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Points_to_TierType_Density}
+ggplot(users) +
+  geom_freqpoly(aes(Points, ..density.., colour = TierType)) +
+  scale_x_log10()
+```
+
+As you can see, users with significantly large number of points are typically masters.
+
+Here are some descriptive statistics of points by each tier:
+
+```{r echo=FALSE, Points_by_Tier_Summary}
+with(users, by(Points, TierType, summary))
+```
+
+`N.Submissions` vs `Ranking` of teams:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Submissions_to_Ranking}
+ggplot(teams) +
+  geom_point(aes(x = N.Submissions, y = Ranking),
+             position = position_jitter(0.3),
+             alpha = 0.1) +
+  scale_y_reverse() +
+  xlim(0, quantile(teams$N.Submissions, 0.95)) +
+  xlab("N.Submissions")
+
+with(teams, cor.test(N.Submissions, Ranking))
+```
+
+I can't say there's an obvious relationship with each other, but I could say "it's less likely to get lower rank if a user submitted more times".
+
+The following plots are pretty interesting though, this time I'm also comparing `N.Submissions` and `Ranking`, but on users:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Users_Submissions_to_Ranking}
+# I created this transition so I can use both cube root scale and reverse.
+reverseroot_trans <- trans_new("reverse_cube_root",
+                               function(x) -(x^(1/3)),
+                               function(x) (-x)^3)
+
+
+plot <- ggplot(users, aes(x = N.Submissions, y = Ranking)) +
+  geom_point(position = position_jitter(0.2),
+             alpha = 0.3)
+
+plot +
+  scale_x_log10() +
+  scale_y_continuous(trans = reverseroot_trans)
+
+plot +
+  scale_x_log10(limits = c(4, 1000)) +
+  scale_y_continuous(trans = reverseroot_trans, limits = c(40000, 0)) +
+  geom_smooth(method = "lm")
+```
+
+They seem to have a non-linear relationship between each other, we can draw a conditional means line to see more clearly:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, NSubmissions_to_Ranking_Means}
+ggplot(users %>%
+         group_by(N.Submissions) %>%
+         summarise(MeanRank = mean(Ranking)),
+       aes(x = N.Submissions, y = MeanRank)) +
+  geom_line() +
+  geom_smooth() +
+  scale_x_log10() +
+  scale_y_reverse()
+```
+
+Apply a hypothesis testing to see the correlation of them:
+
+```{r echo=FALSE, NSubmissions_to_Ranking_Correlation}
+cube_root <- function(x) x^(1/3)
+
+with(subset(users, N.Submissions > 4 &
+                   N.Submissions < 1000 &
+                   Ranking < 40000),
+     cor.test(log10(N.Submissions), cube_root(Ranking)))
+```
+
+This is the largest correlation I've found that isn't what I expected, and it's pretty interesting. However, we can't say submit more causes higher ranking, because correlation does not imply causation.
+
+`N.Submissions` vs `RewardQuantity`:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, NSubmissions_to_RewardQuantity}
+ggplot(teams) +
+  geom_point(aes(x = RewardQuantity, y = N.Submissions),
+             position = position_jitter(0.5),
+             alpha = 0.1) +
+  scale_x_log10() +
+  scale_y_sqrt()
+
+with(teams, cor.test(RewardQuantity, N.Submissions))
+```
+
+In this plot, I was expecting there are more submissions if the reward quantity is large (USD), but it's not really happening.
+
+The following plot is about `RegisterDate` and `Ranking`, and obviously, there isn't any relationship between each other, but something is pretty interesting:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, RegisterDate_to_Ranking}
+ggplot(users) +
+  geom_point(aes(x = RegisterDate, y = Ranking), alpha = 0.1) +
+  scale_y_reverse()
+```
+
+I think that wierd line definitely caught your eye. These are users who didn't earn any ranking points, so the ranking is always the last one, and since there are more and more users register on the platform as the time goes by, the rankings of them are getting larger and larger.
+
+Here are three boxplots showing the distribution of `Ranking`, `Points` and `N.Submissions` for each tier of users:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, TierType_to_Ranking}
+tier.boxplot <- ggplot(users, aes(x = TierType))
+
+tier.boxplot +
+  geom_boxplot(aes(y = Ranking)) +
+  scale_y_reverse()
+
+with(users, by(Ranking, TierType, summary))
+
+tier.boxplot +
+  geom_boxplot(aes(y = Points)) +
+  scale_y_log10() +
+  ylab("Points (log)")
+
+with(users, by(Points, TierType, summary))
+
+tier.boxplot +
+  geom_boxplot(aes(y = N.Submissions)) +
+  scale_y_log10() +
+  ylab("N.Submissions (log)")
+
+with(users, by(N.Submissions, TierType, summary))
+```
+
+By these plots and statistics, you can see how user's tier related to ranking, points, number of submissions.
+
+Notice the second plot doesn't have the box for "Novice", that's because novice users are all having `Points` of 0, and log(0) is `-Inf`, but I applied a log scale to the x-axis.
+
+## Bivariate Analysis
+
+### Talk about some of the relationships you observed in this part of the investigation. How did the feature(s) of interest vary with other features in the dataset?
+Ranking of users tend to correlate with number of submissions a user makes. It looks like it doesn't make sense, but I think the reason this happened is that users who makes a lot of submissions were probably trying to increase their score, even if it only increased 0.01, but that's a huge increment if you're in the top-three of the leaderboard. That's why they update their solution so often.
+
+I also observed some difference between different users with different tiers, they have a significant difference on ranking, points and number of submissions.
+
+### Did you observe any interesting relationships between the other features (not the main feature(s) of interest)?
+There's nothing really crazy I've found in my exploration.
+
+### What was the strongest relationship you found?
+The ranking and number of submissions by a user. They have a correlation coefficient of 0.63, it's not really significantly high, but it's the strongest I've found.
+
+
+## Multivariate Plots Section
+
+Let's start this section with a relationship we just observed, `N.Submissions` to `Ranking`. In this plot, I added a third dimention: `Points`, and represent them using colours:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, NSubmisisons_to_Ranking_and_Points}
+ggplot(users) +
+  geom_point(aes(x = N.Submissions, y = Ranking, colour = Points),
+             position = position_jitter(0.2), alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_continuous(trans = reverseroot_trans) +
+  scale_colour_gradient(trans = "log")
+```
+
+That's exactly what we expected to see.
+
+The following plot is having the same x and y axis as the previous one, but label the points using `TierType`.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, NSubmissions_to_Ranking_and_Tier}
+ggplot(users, aes(x = N.Submissions, y = Ranking, colour = TierType)) +
+  geom_point(position = position_jitter(0.2), alpha = 0.5) +
+  # Avoid overlapping data points of Masters
+  geom_point(subset = .(TierType == "Master"), alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_continuous(trans = reverseroot_trans) +
+  scale_colour_brewer(type = "div", palette = 7,
+      guide = guide_legend(title = "Tier",
+                           reverse = T,
+                           override.aes = list(alpha = 1)))
+
+ggplot(users) +
+  geom_point(aes(x = N.Submissions, y = Ranking), alpha = 0.3) +
+  scale_x_log10() +
+  scale_y_continuous(trans = reverseroot_trans) +
+  facet_grid(~TierType)
+
+with(users, by(users, TierType,
+               function(df) cor.test(df$N.Submissions, df$Ranking)))
+```
+
+Nothing really stands out in these relationships.
+
+Let's look at this plot below, `HighestRanking` vs `Ranking` and `N.Submissions`. My thought here is that if a user is less active, he should have more difference between his highest ranking and current ranking:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, HighestRanking_to_Ranking_and_NSubmissions}
+plot <- ggplot(users) +
+  geom_point(aes(x = HighestRanking,
+                 y = Ranking,
+                 colour = N.Submissions), alpha = 0.3) +
+  scale_colour_gradient(trans = "log")
+
+
+plot
+
+plot + xlim(0, 26000) + ylim(0, 32000)
+```
+
+The second plot I just drawn is a zoom-in version of the first plot. Here I didn't see any interesting relationship.
+
+Now, let's switch the variable that represented with colour to `DaysBeforeSep2015`. I created this variable, it tells how long a user have joined Kaggle.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, HighestRanking_to_Ranking_and_DaysRegister}
+ggplot(users) +
+  geom_point(aes(x = HighestRanking,
+                 y = Ranking,
+                 colour = DaysBeforeSep2015), alpha = 0.3) +
+  scale_colour_gradient(trans = "sqrt") +
+  xlim(0, 26000) +
+  ylim(0, 32000)
+```
+
+Not surprisingly, these three variables are closely related to each other, the longer a user joined Kaggle, the difference between highest ranking and current ranking is larger.
+
+The following plot changes the colour variable to `DaysAfterLastSubmit`, which shows how long it has been after the last submission a user made:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, HighestRanking_to_Ranking_and_LastSubmit}
+ggplot(subset(users, !is.na(DaysAfterLastSubmit))) +
+  geom_point(aes(x = HighestRanking,
+                 y = Ranking,
+                 colour = DaysAfterLastSubmit),
+             alpha = 0.3) +
+  xlim(0, 26000) +
+  ylim(0, 32000)
+```
+
+And yes! They closely related to each other.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, DaysBeforeDeadline_to_Score_and_RewardType}
+ggplot(submissions) +
+  geom_point(aes(x = DaysBeforeDeadline,
+                 y = PublicScore.Z,
+                 colour = RewardType), alpha = 0.3) +
+  scale_x_continuous(trans = reverseroot_trans, limits = c(1500, 0)) +
+  scale_y_log10()
+```
+
+Nothing strange in this plot. We can see there are some blue points (`RewardType == "Knowledge`) away from the main cluster of data points, that's because many competitions with reward type of knowledge (well, it just means no prize) are having long durations, e.g. Titanic: Machine Learning from Disaster.
+
+Another way of looking at this relationship is to cut `DaysBeforeDeadline` into several buckets and use facet plots:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Reward_to_Score_by_DaysBeforeDeadlineCuts}
+submissions$DaysBeforeDeadlineCut <- cut(submissions$DaysBeforeDeadline,
+                                         c(0, 100, 300, 600, 1500))
+
+ggplot(subset(submissions, !is.na(DaysBeforeDeadlineCut))) +
+  geom_boxplot(aes(x = RewardType, y = PublicScore.Z)) +
+  scale_y_log10() +
+  facet_wrap(~DaysBeforeDeadlineCut)
+```
+
+Now we can clearly see how the spreading of scores varies with `DaysBeforeDeadline`. As the time approaching deadline, the scores seem to be more centralised, because participants tend to submit more, and we're taking z-scores. And if you look at the plot in the facet of (300,600], The quartiles are wider, it means the distribution of `PublicScore.Z` is more spreaded out.
+
+In this following plot, I'm going to compare `Duration` and `N.Submissions`, with `RewardType` as colour label:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, Duration_to_Submissions_and_RewardType}
+ggplot(teams) +
+  geom_point(aes(x = Duration,
+                 y = N.Submissions,
+                 colour = RewardType),
+             alpha = 0.3) +
+  scale_x_log10() +
+  scale_y_sqrt()
+
+by(teams, teams$RewardType,
+   function(df) cor.test(df$Duration, df$N.Submissions))
+```
+
+We can't really see any interesting relationship here, but we can see competitions with reward type of USD typically having more wide range of number of submissions than the knowledge ones.
+
+Date registered vs highest ranking and tier:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, RegisterDate_to_HighestRank_and_TierType}
+ggplot(users) +
+  geom_point(aes(x = RegisterDate,
+                 y = HighestRanking,
+                 colour = TierType),
+             alpha = 0.3) +
+  scale_y_reverse()
+```
+
+And again, nothing fancy here.
+
+Here, let's explore with facets. In the following plots, I'm going to facet the plot by type of reward, they could be USD, Knowledge or Others (Kudos, Jobs, Swag). Each scatterplot has x-axis of `DaysBeforeDeadline` and colour label of `Tier`. Here I draw two plots, first one has y-axis of `PublicScore.Z` in each scatterplot, the second one has `PrivateScore.Z`.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, DaysBeforeDeadline_to_Score_by_Tier}
+submissions.with.tiertype <- submissions %>%
+  left_join(users %>% select(Id, TierType),
+            by = c("SubmittedUserId" = "Id"))
+
+plot <- ggplot(submissions.with.tiertype,
+               aes(x = DaysBeforeDeadline, colour = TierType)) +
+  scale_x_continuous(trans = reverseroot_trans) +
+  scale_y_log10() +
+  facet_wrap(~RewardType)
+
+plot + geom_point(aes(y = PublicScore.Z), alpha = 0.3)
+
+plot + geom_point(aes(y = PrivateScore.Z), alpha = 0.3)
+```
+
+Notice that in the scatterplot of `TierType == "Knowledge"`, submissions by different tier are evenly spreaded, but in USD, there's only Kagglers and Masters.
+
+## Multivariate Analysis
+
+### Talk about some of the relationships you observed in this part of the investigation. Were there features that strengthened each other in terms of looking at your feature(s) of interest?
+
+I've found that the time of last submission is having a strong relationship with the difference between highest ranking and current ranking. And this relationship actually strengthened each other, we can use these two features to determine how a user's ranking should be like.
+
+### Were there any interesting or surprising interactions between features?
+Reward type and score, the distribution in the scatterplot of USD (in the plot with facets) seemed to be wider than other two. And that definitely makes me more understand the data.
+
+------
+
+## Final Plots and Summary
+
+### Plot One
+```{r echo=FALSE, Plot_One}
+ggplot(comps.ismax) +
+  geom_histogram(aes(x = PrivateScore.Z), binwidth = 0.01) +
+  xlab("Private Scores (z-scores by competition)") +
+  ggtitle("Distribution of Private Score")
+```
+
+### Description One
+The distribution of z-scores of submissions' private scores by each competition is slightly skewed, having median of 0.37, 1st quartile of -0.21 and 3rd quartile of 0.58. By this, we know that there is a large portion of submissions having private scores above the average. There are some submissions having the same and pretty low scores, which causes some specific z-scores having extremely more matching data points than they should. Perhaps those are submissions where users submitted "all-zeros" solution, and many users done that. This plot made me more understand about how typical distribution of submissions' scores look like.
+
+### Plot Two
+```{r echo=FALSE, message=FALSE, warning=FALSE, Plot_Two}
+ggplot(users, aes(x = N.Submissions, y = Ranking)) +
+  geom_point(colour = "orange",
+             position = position_jitter(0.2),
+             alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  
+  scale_x_log10(limits = c(4, 1000)) +
+  scale_y_continuous(trans = reverseroot_trans, limits = c(40000, 0)) +
+  
+  xlab("log10( Number of submissions )") +
+  ylab("cuberoot( Ranking )") +
+  ggtitle("Submissions by user vs Ranking")
+```
+
+### Description Two
+Number of submissions by user and user's current ranking are having an approximately linear relationship with each other when we apply log10 to submissions number, cube root to ranking. The larger number of submissions a user submitted, the ranking is more likely to be higher. These two variables have a correlation coefficient of 0.63, which is pretty high for a 19804 sample (p-value < 0.000001 in a hypothesis test where alternative hypothesis is the correlation is not 0). Also, the 95% CI for correlation is (0.631, 0.648). The relationship may because users with larger number of submissions are typically more hard-working on these competitions, and more likely to get higher score and ranking. This relationship can help us to infer how a user's rank should be like based on how many submissions submitted by him. However, there could be some traps where someone submitted so many times, but not getting a high score.
+
+### Plot Three
+```{r echo=FALSE, message=FALSE, warning=FALSE, Plot_Three}
+ggplot(subset(users, !is.na(DaysAfterLastSubmit))) +
+  geom_point(aes(x = HighestRanking,
+                 y = Ranking,
+                 colour = DaysAfterLastSubmit),
+             alpha = 0.3) +
+  xlim(0, 26000) +
+  ylim(0, 32000) +
+  guides(colour = guide_colourbar(paste("Days After",
+                                        "Last Submission",
+                                        "(Until Sep 2015)",
+                                        sep = "\n"))) +
+  xlab("Highest Ranking") +
+  ylab("Current Ranking") +
+  ggtitle("User's highest ranking and current ranking with last activity")
+```
+
+### Description Three
+The longer time a user doesn't have any submission activity, the more his ranking drops from his highest ranking, you can see that through the colour gradient in the plot. If we cut "days after last submission" (the colour axis in the plot) into (0,250], (250,500], (500,1000], (1000,2000], then the correlation of highest ranking and current ranking for each group will be 0.91, 0.93, 0.85 and 0.48. We can also use this to infer a user's current ranking, when holding highest ranking constant, users with recent activities not far ago seem to have higher ranking currently but not exceeding highest ranking, and that's why I chose this plot, because of this interesting and strong relationship.
+
+------
+
+## Reflection
+As a non-active Kaggle user, getting familiar with this dataset is quite a hard work, this project actually took me more than a month. This dataset just released months ago, there isn't too much information about this dataset, it's hard to find examples, and there even doesn't have a documentation about the dataset, Kaggle only listed all the variables inside, but not describing what those variables are, I spent so much time to try and explore something from the dataset.  
+A lot of times during the exploration, I felt really difficult because couldn't find anything that interested me and maybe other audiences. I tried to tell myself it's normal, just keep exploring. Eventually, I found some patterns in the data.  
+Throughout the analysis, lots of things are just in line with my expectations, a few of them aren't, e.g. scores, submissions by "days before deadline", number of submissions. I think one that most surprised me is the plot about number of submissions and ranking of users, it makes sense but also doesn't make sense.  
+I'm not quite sure how this dataset can be used, but I think the next step will be building a solid model that predicts who is the winner. Maybe Kaggle will open another competition?
